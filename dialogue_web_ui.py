@@ -13,6 +13,8 @@ UVA 认知对话 — Web 调参台（Gradio）。
 from __future__ import annotations
 
 import argparse
+import threading
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict, Union, cast
 
@@ -33,6 +35,44 @@ class SessionState(TypedDict, total=False):
     agent: CognitiveDialogueAgent
     log: str
     last_fb: Union[DialogueTurn, InternalMonologue, None]
+
+
+# Gradio 5 + queue：State 内放不可 pickle 的 Agent 易导致会话块表错位（KeyError: 0）。
+# 仅在 State 中保存 UUID 字符串，Agent 放在进程内字典。
+_SESSION_LOCK = threading.Lock()
+_SESSION_STORE: Dict[str, SessionState] = {}
+_MAX_SESSIONS = 256
+
+
+def _session_new() -> str:
+    sid = str(uuid.uuid4())
+    with _SESSION_LOCK:
+        if len(_SESSION_STORE) >= _MAX_SESSIONS:
+            for k in list(_SESSION_STORE.keys())[: _MAX_SESSIONS // 4]:
+                _SESSION_STORE.pop(k, None)
+        _SESSION_STORE[sid] = cast(SessionState, {"log": "", "last_fb": None})
+    return sid
+
+
+def _session_get(sid: str) -> Optional[SessionState]:
+    if not sid or not sid.strip():
+        return None
+    with _SESSION_LOCK:
+        return _SESSION_STORE.get(sid.strip())
+
+
+def _session_ensure(sid: str) -> tuple[str, SessionState]:
+    """返回 (有效的 sid, 对应会话 dict)；sid 无效则新建。"""
+    s = (sid or "").strip()
+    if s:
+        with _SESSION_LOCK:
+            st = _SESSION_STORE.get(s)
+        if st is not None:
+            return s, st
+    new_id = _session_new()
+    st2 = _session_get(new_id)
+    assert st2 is not None
+    return new_id, st2
 
 
 def _default_tokenizer_path() -> str:
@@ -93,6 +133,7 @@ def _append_log(state: SessionState, block: str) -> SessionState:
 
 
 def load_model(
+    session_id: str,
     tokenizer_path: str,
     dialogue_path: str,
     learn_tokenizer: bool,
@@ -110,13 +151,14 @@ def load_model(
     curiosity_pool_max: float,
     curiosity_per_event_cap: float,
     curiosity_refill_external: float,
-) -> tuple[SessionState, str]:
+) -> tuple[str, str]:
+    sid_prev = (session_id or "").strip()
     tok_path = tokenizer_path.strip()
     if not tok_path:
-        return cast(SessionState, {}), "请填写分词器 JSON 路径。"
+        return sid_prev, "请填写分词器 JSON 路径。"
     p = Path(tok_path)
     if not p.is_file():
-        return cast(SessionState, {}), f"分词器文件不存在: {p}"
+        return sid_prev, f"分词器文件不存在: {p}"
 
     tok = PrecisionTokenizer.load_model(str(p.resolve()))
     seed: Optional[int] = None
@@ -125,7 +167,7 @@ def load_model(
         try:
             seed = int(s)
         except ValueError:
-            return cast(SessionState, {}), "内心随机种子须为整数或留空。"
+            return sid_prev, "内心随机种子须为整数或留空。"
 
     agent = CognitiveDialogueAgent(
         tok,
@@ -150,77 +192,88 @@ def load_model(
     if dlg:
         dp = Path(dlg)
         if not dp.is_file():
-            return cast(SessionState, {}), f"对话状态文件不存在: {dp}"
+            return sid_prev, f"对话状态文件不存在: {dp}"
         agent.load_dialogue_model(str(dp.resolve()))
 
-    st: SessionState = {"agent": agent, "log": "", "last_fb": None}
+    sid, st = _session_ensure(sid_prev)
+    st["agent"] = agent
+    st["log"] = ""
+    st["last_fb"] = None
     msg = f"已加载分词器: `{p}`"
     if dlg:
         msg += f"\n已加载对话状态: `{Path(dlg).resolve()}`"
     msg += f"\n分词器 fitted={tok.fitted}"
-    return st, msg
+    return sid, msg
 
 
-def run_single_turn(state: SessionState, user_text: str) -> tuple[SessionState, str, str]:
-    if not state or "agent" not in state:
-        return cast(SessionState, {}), "", "请先点击「加载模型」。"
+def run_single_turn(session_id: str, user_text: str) -> tuple[str, str, str]:
+    sid = (session_id or "").strip()
+    st = _session_get(sid)
+    if not st or "agent" not in st:
+        return sid, "", "请先点击「加载模型」。"
     text = (user_text or "").strip()
     if not text:
-        return state, state.get("log", ""), "（用户输入为空）"
-    agent = state["agent"]
+        return sid, st.get("log", ""), "（用户输入为空）"
+    agent = st["agent"]
     turn = agent.turn(text)
-    state["last_fb"] = turn
+    st["last_fb"] = turn
     block = _format_turn(turn)
-    _append_log(state, block)
-    return state, state["log"], "本轮已完成。"
+    _append_log(st, block)
+    return sid, st["log"], "本轮已完成。"
 
 
-def run_internal_tick(state: SessionState) -> tuple[SessionState, str, str]:
-    if not state or "agent" not in state:
-        return cast(SessionState, {}), "", "请先点击「加载模型」。"
-    agent = state["agent"]
+def run_internal_tick(session_id: str) -> tuple[str, str, str]:
+    sid = (session_id or "").strip()
+    st = _session_get(sid)
+    if not st or "agent" not in st:
+        return sid, "", "请先点击「加载模型」。"
+    agent = st["agent"]
     mono = agent.internal_tick()
     if mono is None:
         block = "### 内心一拍\n- （本拍无输出：未过阈或无候选）"
-        state["last_fb"] = None
+        st["last_fb"] = None
     else:
-        state["last_fb"] = mono
+        st["last_fb"] = mono
         block = _format_mono(mono)
-    _append_log(state, block)
-    return state, state["log"], "内心一拍已完成。"
+    _append_log(st, block)
+    return sid, st["log"], "内心一拍已完成。"
 
 
-def apply_feedback_cmd(state: SessionState, cmd: str) -> tuple[SessionState, str, str]:
-    if not state or "agent" not in state:
-        return cast(SessionState, {}), "", "请先加载模型。"
+def apply_feedback_cmd(session_id: str, cmd: str) -> tuple[str, str, str]:
+    sid = (session_id or "").strip()
+    st = _session_get(sid)
+    if not st or "agent" not in st:
+        return sid, "", "请先加载模型。"
     rew = _feedback_reward(cmd)
     if rew is None:
-        return state, state.get("log", ""), "请输入 good、bad 或 meh。"
-    fb = state.get("last_fb")
+        return sid, st.get("log", ""), "请输入 good、bad 或 meh。"
+    fb = st.get("last_fb")
     if fb is None:
-        return state, state.get("log", ""), "尚无上一轮可对齐的模型输出（先跑单轮对话或内心一拍）。"
-    agent = state["agent"]
+        return sid, st.get("log", ""), "尚无上一轮可对齐的模型输出（先跑单轮对话或内心一拍）。"
+    agent = st["agent"]
     if isinstance(fb, DialogueTurn):
         agent.apply_dialogue_feedback(rew, fb)
     else:
         agent.apply_internal_monologue_feedback(rew, fb)
     note = f"### 偏好反馈\n- 命令: `{cmd.strip()}` → reward={rew:+.0f}\n- 类型: `{'对外轮' if isinstance(fb, DialogueTurn) else '内心'}`"
-    state["last_fb"] = None
-    _append_log(state, note)
-    return state, state["log"], "已记录反馈。"
+    st["last_fb"] = None
+    _append_log(st, note)
+    return sid, st["log"], "已记录反馈。"
 
 
-def clear_log(state: SessionState) -> tuple[SessionState, str, str]:
-    if state:
-        state["log"] = ""
-        state["last_fb"] = None
-    return state or cast(SessionState, {}), "", "日志已清空。"
+def clear_log(session_id: str) -> tuple[str, str, str]:
+    sid = (session_id or "").strip()
+    st = _session_get(sid)
+    if st:
+        st["log"] = ""
+        st["last_fb"] = None
+    return sid, "", "日志已清空。"
 
 
 def build_ui() -> gr.Blocks:
-    state: gr.State = gr.State(cast(SessionState, {}))
-
     with gr.Blocks(title="UVA 对话调参台") as demo:
+        # Gradio 5：State 内仅存可序列化的 session UUID；Agent 在内存 `_SESSION_STORE`。
+        session_id_state: gr.State = gr.State(value="")
         gr.Markdown(
             "# UVA 认知对话 · Web 调参台\n"
             "加载分词器（及可选 `.dialogue.json`）后，可调整下方超参并重新加载；"
@@ -270,6 +323,7 @@ def build_ui() -> gr.Blocks:
                 c_ref = gr.Slider(0.0, 0.2, value=0.06, step=0.005, label="curiosity_pool_refill_external")
 
         load_inputs: List[Any] = [
+            session_id_state,
             tok_path,
             dlg_path,
             learn_tok,
@@ -308,27 +362,27 @@ def build_ui() -> gr.Blocks:
         load_btn.click(
             fn=load_model,
             inputs=load_inputs,
-            outputs=[state, load_status],
+            outputs=[session_id_state, load_status],
         )
         run_btn.click(
             fn=run_single_turn,
-            inputs=[state, user_in],
-            outputs=[state, log_out, run_status],
+            inputs=[session_id_state, user_in],
+            outputs=[session_id_state, log_out, run_status],
         )
         tick_btn.click(
             fn=run_internal_tick,
-            inputs=[state],
-            outputs=[state, log_out, run_status],
+            inputs=[session_id_state],
+            outputs=[session_id_state, log_out, run_status],
         )
         fb_btn.click(
             fn=apply_feedback_cmd,
-            inputs=[state, fb_in],
-            outputs=[state, log_out, run_status],
+            inputs=[session_id_state, fb_in],
+            outputs=[session_id_state, log_out, run_status],
         )
         clr_btn.click(
             fn=clear_log,
-            inputs=[state],
-            outputs=[state, log_out, run_status],
+            inputs=[session_id_state],
+            outputs=[session_id_state, log_out, run_status],
         )
 
     return demo
