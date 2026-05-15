@@ -13,6 +13,7 @@ from .dialogue import (
     PREFERENCE_STATE_FORMAT,
 )
 from .word_imprints import WordStateImprint, WordStateMemory
+from .auto_feedback import AutoFeedbackConfig
 
 __all__ = [
     "UnifiedVariationalAttentionModel",
@@ -31,4 +32,5 @@ __all__ = [
     "PREFERENCE_STATE_FORMAT",
     "WordStateImprint",
     "WordStateMemory",
+    "AutoFeedbackConfig",
 ]

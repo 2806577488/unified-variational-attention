@@ -17,7 +17,8 @@ Python 包名：`uva_model`。对外主要类型见 `uva_model/__init__.py`。
 | 模块 | 文件 | 职责 |
 |------|------|------|
 | 分词与资源 | `tokenizer.py` | `PrecisionTokenizer`：精度驱动分词、惊奇 trace、R/m 自调节 |
-| 对话与 EFE | `dialogue.py` | `CognitiveDialogueAgent`：倾听 → 意图 → 候选稿 → 预期自由能择优 |
+| 对话与 EFE | `dialogue.py` | `CognitiveDialogueAgent`：倾听 → 意图 → 候选稿 → 预期自由能择优；`turn()` 含 C 方案自动反馈 |
+| 自动反馈 | `auto_feedback.py` | 无标注行为信号（接纳 / 回避 / 持续）→ `apply_dialogue_feedback` |
 | 词态印记 | `word_imprints.py` | `WordStateMemory`：语境向量印记、联想、激活前沿 |
 | 变分注意基座 | `model.py` | `UnifiedVariationalAttentionModel`：自由能、精度、容量约束（算术课等示例） |
 | 语料 IO | `corpus_jsonl.py` | JSONL 流式读入与 episode 切分 |

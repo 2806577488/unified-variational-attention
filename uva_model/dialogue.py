@@ -36,6 +36,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, Dict, List, Literal, Optional, Tuple, cast
 
+from .auto_feedback import (
+    AutoFeedbackConfig,
+    infer_auto_feedback,
+    infer_continuation_feedback,
+)
 from .checkpoint_json import infer_compression_from_path, read_json_document, write_json_document
 from .tokenizer import PrecisionTokenizer
 from .word_imprints import WORD_STATE_MEMORY_FORMAT, WordStateImprint, WordStateMemory
@@ -172,6 +177,7 @@ class CognitiveDialogueAgent:
         curiosity_injection_w_pending: float = 1.0,
         curiosity_injection_w_debt: float = 1.0,
         curiosity_injection_w_sigma: float = 1.0,
+        auto_feedback_config: Optional[AutoFeedbackConfig] = None,
     ) -> None:
         self.tokenizer = tokenizer
         self._sigma: Dict[str, float] = {k: 0.5 for k in self.SLOT_NAMES}
@@ -231,6 +237,13 @@ class CognitiveDialogueAgent:
         self._branch_bias: Dict[str, float] = {}
         self._token_value: Dict[str, float] = {}
         self._association_value: Dict[str, Dict[str, float]] = {}
+        self._auto_fb_config = (
+            auto_feedback_config
+            if auto_feedback_config is not None
+            else AutoFeedbackConfig()
+        )
+        self._last_turn: Optional[DialogueTurn] = None
+        self._consecutive_dialogue_turns = 0
 
     def set_compute_device(self, device: str) -> str:
         """设置词印记相似度计算设备；当前主要影响 internal_tick 的全库扫描。"""
@@ -287,6 +300,8 @@ class CognitiveDialogueAgent:
         self._token_value = {}
         self._association_value = {}
         self._curiosity_injection_pool = float(self.curiosity_injection_pool_max)
+        self._last_turn = None
+        self._consecutive_dialogue_turns = 0
 
     def _apply_preference_state_payload(self, raw: Dict[str, object]) -> None:
         """已校验 ``format == preference_state_v1``；整表覆盖写入。"""
@@ -322,6 +337,7 @@ class CognitiveDialogueAgent:
             )
         else:
             self._curiosity_injection_pool = float(self.curiosity_injection_pool_max)
+        self._restore_auto_feedback_session_from_preference(raw)
 
     def _merge_preference_state_patch(self, raw: Dict[str, object]) -> None:
         """``patch_dialogue_model_dict``：仅合并出现的子键。"""
@@ -348,6 +364,17 @@ class CognitiveDialogueAgent:
                     0.0,
                     min(self.curiosity_injection_pool_max, float(cip)),
                 )
+        if "auto_feedback_session" in raw:
+            afs = raw.get("auto_feedback_session")
+            if afs is None:
+                self._last_turn = None
+                self._consecutive_dialogue_turns = 0
+            elif isinstance(afs, dict):
+                self._restore_auto_feedback_session_from_preference(afs)
+        if "auto_feedback_config" in raw:
+            afc = raw.get("auto_feedback_config")
+            if isinstance(afc, dict):
+                self._auto_fb_config = self._auto_feedback_config_from_dict(afc)
 
     def apply_dialogue_model_dict(self, data: Dict[str, object]) -> None:
         """
@@ -438,13 +465,109 @@ class CognitiveDialogueAgent:
         assoc_out: Dict[str, Dict[str, float]] = {}
         for tr, inner in self._association_value.items():
             assoc_out[str(tr)] = {str(a): float(v) for a, v in inner.items()}
-        return {
+        out: Dict[str, object] = {
             "format": PREFERENCE_STATE_FORMAT,
             "branch_bias": {str(k): float(v) for k, v in self._branch_bias.items()},
             "token_value": {str(k): float(v) for k, v in self._token_value.items()},
             "association_value": assoc_out,
             "curiosity_injection_pool": float(self._curiosity_injection_pool),
+            "auto_feedback_config": self._auto_feedback_config_to_dict(),
+            "auto_feedback_session": self._auto_feedback_session_to_dict(),
         }
+        return out
+
+    @staticmethod
+    def _auto_feedback_config_to_dict_static(cfg: AutoFeedbackConfig) -> Dict[str, object]:
+        return {
+            "enabled": bool(cfg.enabled),
+            "acceptance_reward": float(cfg.acceptance_reward),
+            "avoidance_reward": float(cfg.avoidance_reward),
+            "continuation_min_turns": int(cfg.continuation_min_turns),
+            "continuation_reward_base": float(cfg.continuation_reward_base),
+            "evasion_max_length": int(cfg.evasion_max_length),
+            "combine_mode": str(cfg.combine_mode),
+        }
+
+    def _auto_feedback_config_to_dict(self) -> Dict[str, object]:
+        return self._auto_feedback_config_to_dict_static(self._auto_fb_config)
+
+    @staticmethod
+    def _auto_feedback_config_from_dict(raw: Dict[str, object]) -> AutoFeedbackConfig:
+        return AutoFeedbackConfig(
+            enabled=bool(raw.get("enabled", True)),
+            acceptance_reward=float(raw.get("acceptance_reward", 0.5)),
+            avoidance_reward=float(raw.get("avoidance_reward", -0.2)),
+            continuation_min_turns=int(raw.get("continuation_min_turns", 3)),
+            continuation_reward_base=float(raw.get("continuation_reward_base", 0.3)),
+            evasion_max_length=int(raw.get("evasion_max_length", 8)),
+            combine_mode=str(raw.get("combine_mode", "mean")),
+        )
+
+    def _turn_feedback_snapshot(self, turn: DialogueTurn) -> Dict[str, object]:
+        return {
+            "output_branch": str(turn.output_branch),
+            "conflict_focus_token": str(turn.conflict_focus_token or ""),
+            "association_trigger": str(turn.association_trigger or ""),
+            "association_pick": str(turn.association_pick or ""),
+        }
+
+    def _turn_from_feedback_snapshot(self, snap: Dict[str, object]) -> DialogueTurn:
+        intent = CommunicativeIntent(
+            speech_act="respond",
+            anchor_slot=self.SLOT_NAMES[0],
+            tension_slot=self.SLOT_NAMES[1],
+            u_curiosity=0.0,
+            u_task=0.0,
+        )
+        return DialogueTurn(
+            user_text="",
+            reply="",
+            u_curiosity=0.0,
+            u_task=0.0,
+            pi_statement=0.0,
+            epsilon_social_in=0.0,
+            epsilon_secondary=0.0,
+            intent=intent,
+            replan_count=0,
+            output_branch=cast(OutputBranch, str(snap.get("output_branch", "conservative"))),
+            conflict_focus_token=str(snap.get("conflict_focus_token", "")),
+            association_trigger=str(snap.get("association_trigger", "")),
+            association_pick=str(snap.get("association_pick", "")),
+        )
+
+    def _auto_feedback_session_to_dict(self) -> Dict[str, object]:
+        return {
+            "consecutive_dialogue_turns": int(self._consecutive_dialogue_turns),
+            "last_turn": (
+                self._turn_feedback_snapshot(self._last_turn)
+                if self._last_turn is not None
+                else None
+            ),
+        }
+
+    def _restore_auto_feedback_session_from_preference(self, raw: Dict[str, object]) -> None:
+        afs = raw.get("auto_feedback_session")
+        if afs is None:
+            if "consecutive_dialogue_turns" not in raw and "last_turn" not in raw:
+                return
+            afs = raw
+        if not isinstance(afs, dict):
+            return
+        ct = afs.get("consecutive_dialogue_turns", 0)
+        self._consecutive_dialogue_turns = max(0, int(ct)) if isinstance(ct, (int, float)) else 0
+        lt = afs.get("last_turn")
+        if isinstance(lt, dict):
+            self._last_turn = self._turn_from_feedback_snapshot(lt)
+        else:
+            self._last_turn = None
+        afc = raw.get("auto_feedback_config")
+        if isinstance(afc, dict):
+            self._auto_fb_config = self._auto_feedback_config_from_dict(afc)
+
+    def reset_auto_feedback_session(self) -> None:
+        """清空自动反馈会话计数与上一轮快照（不影响已写入的偏好 EMA）。"""
+        self._last_turn = None
+        self._consecutive_dialogue_turns = 0
 
     def save_dialogue_model(
         self,
@@ -1533,9 +1656,52 @@ class CognitiveDialogueAgent:
         """
         return [self.train_step(text) for text in user_texts if text.strip()]
 
+    def _infer_auto_feedback_reward(
+        self,
+        prev_turn: DialogueTurn,
+        curr_user_text: str,
+    ) -> Optional[float]:
+        return infer_auto_feedback(
+            prev_branch=str(prev_turn.output_branch),
+            prev_focus_token=prev_turn.conflict_focus_token,
+            prev_association_pick=prev_turn.association_pick,
+            curr_user_text=curr_user_text,
+            consecutive_turns=self._consecutive_dialogue_turns,
+            config=self._auto_fb_config,
+        )
+
     def turn(self, user_text: str) -> DialogueTurn:
-        """对外 API：一轮完整认知对话回路。"""
-        return self.produce_turn(user_text)
+        """
+        对外 API：一轮完整认知对话回路。
+
+        在 ``produce_turn`` 之后，用本轮用户输入对上一轮做 C 方案行为信号推断并
+        ``apply_dialogue_feedback``（接纳 / 回避）；连续轮数达标时再施加持续信号。
+        直接调用 ``produce_turn`` 不会触发自动反馈。
+        """
+        turn = self.produce_turn(user_text)
+
+        if self._auto_fb_config.enabled and self._last_turn is not None:
+            reward = self._infer_auto_feedback_reward(self._last_turn, user_text)
+            if reward is not None:
+                self.apply_dialogue_feedback(reward, self._last_turn)
+
+        self._consecutive_dialogue_turns += 1
+        if (
+            self._auto_fb_config.enabled
+            and self._last_turn is not None
+            and self._consecutive_dialogue_turns
+            >= self._auto_fb_config.continuation_min_turns
+        ):
+            cont_reward = infer_continuation_feedback(
+                self._consecutive_dialogue_turns,
+                min_turns=self._auto_fb_config.continuation_min_turns,
+                base_reward=self._auto_fb_config.continuation_reward_base,
+            )
+            if cont_reward is not None:
+                self.apply_dialogue_feedback(cont_reward, self._last_turn)
+
+        self._last_turn = turn
+        return turn
 
 
 __all__ = [
@@ -1547,4 +1713,5 @@ __all__ = [
     "PREFERENCE_STATE_FORMAT",
     "InternalMonologue",
     "OutputBranch",
+    "AutoFeedbackConfig",
 ]
