@@ -4,9 +4,27 @@
 
 ## 功能概览
 
-- **对话**：`example_run.py` 交互 / 批量训练；`dialogue_web_ui.py` Gradio 调参台
-- **核心包**：`uva_model/`（`tokenizer`、`dialogue`、`word_imprints`、`model` 等）
-- **审计与修复说明**：`docs/AUDIT_FINDINGS_AND_REMEDIATION.md`
+| 入口 | 说明 |
+|------|------|
+| `example_run.py` | 命令行：交互对话、批量训练、语料导入 |
+| `dialogue_web_ui.py` | Gradio Web 调参台（单轮对话 / 内心一拍 / 偏好反馈） |
+| `docs/AUDIT_FINDINGS_AND_REMEDIATION.md` | 性能审计结论与已落地修复记录 |
+
+## 核心包 `uva_model`
+
+Python 包名：`uva_model`。对外主要类型见 `uva_model/__init__.py`。
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| 分词与资源 | `tokenizer.py` | `PrecisionTokenizer`：精度驱动分词、惊奇 trace、R/m 自调节 |
+| 对话与 EFE | `dialogue.py` | `CognitiveDialogueAgent`：倾听 → 意图 → 候选稿 → 预期自由能择优 |
+| 词态印记 | `word_imprints.py` | `WordStateMemory`：语境向量印记、联想、激活前沿 |
+| 变分注意基座 | `model.py` | `UnifiedVariationalAttentionModel`：自由能、精度、容量约束（算术课等示例） |
+| 语料 IO | `corpus_jsonl.py` | JSONL 流式读入与 episode 切分 |
+| 检查点 | `checkpoint_json.py` | 对话/分词器 JSON 读写（含 gzip） |
+| 算术示例 | `arithmetic.py` | 预测编码算术课（与对话主路径独立） |
+| 课程与评测 | `curriculum.py` | 训练课程与评测钩子 |
+| 可选加速 | `_tokenizer_accel.pyx` | Cython 分词热路径（`setup.py build_ext` 编译） |
 
 ## 环境
 
@@ -53,15 +71,19 @@ python dialogue_web_ui.py
 # 浏览器打开终端显示的地址（默认 http://127.0.0.1:7860）
 ```
 
-## 目录结构
+## 仓库目录
 
 ```
-uva_model/           # 库代码
-tests/               # 单元测试与审计回归
-example_run.py       # CLI：对话 / 训练 / 语料
-dialogue_web_ui.py   # Gradio Web UI
-train_tokenizer_from_chunks.py
-docs/                # 审计与修复文档
+unified-variational-attention/
+├── uva_model/              # 核心库（见上表）
+├── tests/                  # 单元测试与审计回归
+├── docs/                   # 设计 / 审计文档
+├── example_run.py          # 主 CLI
+├── dialogue_web_ui.py      # Web UI
+├── train_tokenizer_from_chunks.py
+├── compact_uva_checkpoint.py
+├── setup.py                # Cython 扩展构建
+└── pyproject.toml
 ```
 
 ## 语料与 QQ 导出
