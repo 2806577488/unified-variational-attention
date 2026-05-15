@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+.env
+.env.*
+
+# Test / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Cython 生成（保留 .pyx）
+uva_model/_tokenizer_accel.c
+
+# 本地大模型 / 分词器权重（请自行训练或从 Release 下载）
+tokenizer_zh_from_chunks.json
+tokenizer_zh_from_chunks_v2.json
+tokenizer_zh_from_chunks_v2.small.json
+tokenizer_zh_from_chunks_v2.dialogue.small.json
+tokenizer_chunks_preview.json
+tokenizer_tmp_*.json
+
+# 对话 checkpoint（保留小示例可在仓库内；大文件勿提交）
+*.dialogue.json
+!docs/examples/*.dialogue.json
+
+# 数据与导出
+*.jsonl
+*.jsonl.gz
+exportsmessage/
+data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store

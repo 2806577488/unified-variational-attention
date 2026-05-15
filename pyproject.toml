@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "Cython>=3.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unified-variational-attention"
+version = "0.1.0"
+description = "UVA cognitive dialogue: precision tokenizer, word imprints, EFE-driven agent"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "UVA Contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "Cython>=3.0"]
+web = ["gradio>=4.44.0,<6"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["uva_model*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

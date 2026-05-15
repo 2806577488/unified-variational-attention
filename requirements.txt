@@ -1,0 +1,8 @@
+# 核心运行（对话 / 训练 CLI）
+# 可选加速：pip install torch 后 word_imprints 可走 GPU top-k
+
+# 开发与测试
+pytest>=7.0
+
+# Web 调参台（可选）
+# pip install -r requirements-web.txt
